@@ -15,6 +15,7 @@ from .fingerprint import identify, TrackInfo
 from .scrobbler import Scrobbler, canonicalize_track
 from .display import Display
 from .spotify import SpotifyClient
+from .albumlock import AlbumLock
 
 logger = logging.getLogger("spindle")
 
@@ -50,7 +51,6 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    # Silence noisy third-party loggers
     for noisy in ("httpcore", "httpx", "urllib3", "pylast", "asyncio",
                   "aiohttp_retry", "aiohttp", "shazamio", "shazamio_core",
                   "shazamio.request"):
@@ -60,12 +60,11 @@ def main():
     cfg = load_config(args.config)
     logger.info("Spindle v%s starting", __version__)
 
-    # Validate required keys
     if not cfg.acoustid.api_key:
         logger.error("AcoustID API key not set — check config.yaml")
         sys.exit(1)
 
-    # Last.fm network
+    # Last.fm
     scrobbler = None
     lastfm_read_network = None
 
@@ -74,13 +73,11 @@ def main():
             logger.error("Last.fm api_key/api_secret required for --canonicalize-preview")
             sys.exit(1)
         import pylast
-
         lastfm_read_network = pylast.LastFMNetwork(
             api_key=cfg.lastfm.api_key,
             api_secret=cfg.lastfm.api_secret,
         )
 
-    # Connect to Last.fm (unless dry run)
     if not args.dry_run:
         if not cfg.lastfm.api_key or not cfg.lastfm.username:
             logger.error("Last.fm credentials not set — check config.yaml")
@@ -88,20 +85,22 @@ def main():
         scrobbler = Scrobbler(cfg.lastfm, cfg.scrobble)
         scrobbler.connect()
 
-    # Spotify client for canonical track names
+    # Spotify + album lock
     spotify = None
+    album_lock = None
     if cfg.spotify.client_id and cfg.spotify.client_secret:
         spotify = SpotifyClient(cfg.spotify)
-        logger.info("Spotify lookup enabled")
+        album_lock = AlbumLock(spotify, min_play_seconds=cfg.scrobble.min_play_seconds)
+        logger.info("Spotify lookup + album-lock enabled")
     else:
         logger.info("Spotify lookup disabled (no credentials)")
 
-    # Init display
+    # Display
     display = Display(enabled=cfg.display.enabled)
     display.init()
     display.show_idle()
 
-    # Signal handling
+    # Signals
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
@@ -110,11 +109,12 @@ def main():
     if args.dry_run:
         logger.info("DRY RUN — will identify but not scrobble")
 
-    def track_key(t) -> str:
+    # --- Helpers ---
+
+    def track_key(t: TrackInfo) -> str:
         return f"{t.artist.lower()} - {t.title.lower()}"
 
-    def should_scrobble(t, start: float) -> bool:
-        """True if the track has played long enough to scrobble."""
+    def should_scrobble(t: TrackInfo, start: float) -> bool:
         played = time.time() - start
         if played < cfg.scrobble.min_play_seconds:
             return False
@@ -122,36 +122,44 @@ def main():
             return False
         return True
 
-    def finalize(t, start: float) -> None:
-        """Scrobble current track if it played long enough."""
+    def do_scrobble(t: TrackInfo, timestamp: float) -> None:
+        """Scrobble a single track."""
+        if not scrobbler or args.dry_run:
+            return
+        scrobbler.scrobble(t, timestamp=int(timestamp))
+
+    def finalize(t: TrackInfo, start: float) -> None:
         if not t or args.dry_run:
             return
         if should_scrobble(t, start):
-            scrobbler.scrobble(t, timestamp=int(start))
+            do_scrobble(t, start)
         else:
-            played = time.time() - start
-            logger.debug("Track too short to scrobble: %.0fs played", played)
+            logger.debug("Track too short to scrobble: %.0fs played", time.time() - start)
 
-    # Track state
+    # --- Track state ---
     current_track = None
     track_start = 0.0
     track_scrobbled = False
 
-    # Main loop
+    # --- Main loop ---
     consecutive_silence = 0
     while _running:
         try:
-            # Capture audio
             wav_path = capture_chunk(cfg.audio)
 
             try:
-                # Silence detection
+                # --- Silence ---
                 if is_silence(wav_path, cfg.silence):
                     consecutive_silence += 1
                     if consecutive_silence == 1:
                         logger.info("Silence detected — waiting for music")
                         if current_track and not track_scrobbled:
                             finalize(current_track, track_start)
+                        # Album lock: scrobble current track on silence
+                        if album_lock:
+                            silence_track = album_lock.on_silence()
+                            if silence_track and not track_scrobbled:
+                                do_scrobble(silence_track, track_start)
                         current_track = None
                         track_scrobbled = False
                         display.show_idle()
@@ -159,30 +167,71 @@ def main():
 
                 consecutive_silence = 0
 
-                # Identify track
+                # --- Album-lock: check if current track ended by timing ---
+                if album_lock and album_lock.is_locked() and not args.dry_run:
+                    advanced_track = album_lock.check_advance()
+                    if advanced_track:
+                        # Previous track finished by timing — scrobble it
+                        do_scrobble(advanced_track, track_start)
+                        # Update state to the new predicted track
+                        predicted = album_lock.get_predicted_track()
+                        if predicted:
+                            current_track = predicted
+                            track_start = time.time()
+                            track_scrobbled = False
+                            logger.info("Now playing (album-lock): %s — %s",
+                                        predicted.artist, predicted.title)
+                            scrobbler.update_now_playing(predicted)
+                            display.show_track(predicted)
+
+                # --- Fingerprint ---
                 track = identify(wav_path, cfg.acoustid, cfg.fingerprint)
+
+                # If no fingerprint but album-locked, trust the prediction
+                if not track and album_lock and album_lock.is_locked():
+                    predicted = album_lock.get_predicted_track()
+                    if predicted:
+                        logger.debug("No fingerprint — trusting album-lock: %s — %s",
+                                     predicted.artist, predicted.title)
+                        # Update now playing with predicted track
+                        if not args.dry_run:
+                            scrobbler.update_now_playing(predicted)
+                    continue
+
                 if not track:
                     continue
 
-                # Spotify canonical lookup
+                # --- Spotify lookup ---
+                spotify_result = None
                 if spotify:
-                    canonical = spotify.lookup(track.artist, track.title)
-                    if canonical:
-                        if not canonical.album and track.album:
-                            canonical = TrackInfo(
-                                title=canonical.title,
-                                artist=canonical.artist,
-                                album=track.album,
-                                duration=canonical.duration or track.duration,
+                    spotify_result = spotify.lookup(track.artist, track.title)
+                    if spotify_result:
+                        track = spotify_result.track
+                        if not track.album and spotify_result.album_name:
+                            track = TrackInfo(
+                                title=track.title,
+                                artist=track.artist,
+                                album=spotify_result.album_name,
+                                duration=track.duration,
                                 mbid=track.mbid,
-                                source=canonical.source,
-                                confidence=canonical.confidence,
+                                source=track.source,
+                                confidence=track.confidence,
                             )
-                        track = canonical
 
-                # Update display
+                # --- Album lock ---
+                if album_lock and spotify_result and not args.dry_run:
+                    backfill = album_lock.on_track_identified(spotify_result)
+                    if backfill:
+                        # Scrobble backfilled tracks
+                        for bf_track in backfill:
+                            logger.info("Album-lock backfill: %s — %s",
+                                        bf_track.artist, bf_track.title)
+                            do_scrobble(bf_track, time.time() - (bf_track.duration or 180))
+
+                # --- Display ---
                 display.show_track(track)
 
+                # --- Dry run ---
                 if args.dry_run:
                     line = (
                         f"🎵 {track.artist} — {track.title}"
@@ -195,25 +244,24 @@ def main():
                             line += f"\n   ↳ canonical: {canon.artist} — {canon.title}"
                         if canon.duration and not track.duration:
                             line += f"\n   ↳ duration: {canon.duration}s"
+                    if album_lock and album_lock.is_locked():
+                        line += f"\n   ↳ album-lock: active"
                     print(line)
                     continue
 
-                # Track change detection
+                # --- Track change detection ---
                 if current_track is None or track_key(track) != track_key(current_track):
-                    # Finalize previous track (scrobble if not already done)
                     if current_track and not track_scrobbled:
                         finalize(current_track, track_start)
-                    # Start new track
                     current_track = track
                     track_start = time.time()
                     track_scrobbled = False
                     logger.info("Now playing: %s — %s", track.artist, track.title)
                     scrobbler.update_now_playing(track)
                 else:
-                    # Same track still playing
-                    # Scrobble once after meeting the play threshold
+                    # Same track — scrobble once after threshold
                     if not track_scrobbled and should_scrobble(current_track, track_start):
-                        scrobbler.scrobble(current_track, timestamp=int(track_start))
+                        do_scrobble(current_track, track_start)
                         track_scrobbled = True
                     scrobbler.update_now_playing(track)
 
@@ -229,6 +277,10 @@ def main():
     # Finalize on exit
     if current_track and not track_scrobbled:
         finalize(current_track, track_start)
+    if album_lock:
+        silence_track = album_lock.on_silence()
+        if silence_track:
+            do_scrobble(silence_track, track_start)
     display.clear()
     logger.info("Spindle stopped")
 
