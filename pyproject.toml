@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "spindle"
+version = "0.1.0"
+description = "Vinyl scrobbler for Raspberry Pi — fingerprint what's playing and scrobble to Last.fm"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "LuKres", email = "me@lukres.dev" },
+]
+keywords = ["vinyl", "scrobbler", "lastfm", "acoustid", "raspberry-pi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+dependencies = [
+    "pyacoustid>=1.3.0",
+    "pylast>=5.0.0",
+    "shazamio>=0.7.0",
+    "musicbrainzngs>=0.7.1",
+    "PyYAML>=6.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+display = [
+    "Pillow>=10.0.0",
+    "spidev>=3.6",
+    "RPi.GPIO>=0.7.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/LuKresXD/spindle"
+Issues = "https://github.com/LuKresXD/spindle/issues"
+
+[project.scripts]
+spindle = "spindle.cli:main"

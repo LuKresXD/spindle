@@ -1,0 +1,38 @@
+# Spindle configuration
+# Copy to config.yaml and fill in your keys
+
+acoustid:
+  api_key: "your-acoustid-api-key"
+
+lastfm:
+  api_key: "your-lastfm-api-key"
+  api_secret: "your-lastfm-shared-secret"
+  username: "your-lastfm-username"
+  # password_hash: "md5-of-your-password"  # generated on first auth
+
+audio:
+  device: "plughw:CARD=Device,DEV=0"  # ALSA device
+  sample_rate: 44100
+  channels: 1
+  chunk_duration: 25  # seconds per fingerprint chunk
+
+fingerprint:
+  acoustid_timeout: 10  # seconds
+  shazam_fallback: true
+  min_confidence: 0.5
+
+scrobble:
+  min_play_seconds: 30       # minimum before scrobbling
+  min_play_fraction: 0.5     # or 50% of track length
+  now_playing: true           # update "now playing" on Last.fm
+  dedup_window: 300           # ignore same track within 5 min
+
+silence:
+  threshold_db: -40           # below this = silence
+  min_silence_seconds: 3      # gap between tracks
+
+display:
+  enabled: false              # enable when Waveshare LCD is connected
+  width: 480
+  height: 320
+  spi_device: "/dev/spidev0.0"
