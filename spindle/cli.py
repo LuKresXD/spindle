@@ -50,6 +50,11 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Silence noisy third-party loggers
+    for noisy in ("httpcore", "httpx", "urllib3", "pylast", "asyncio",
+                  "aiohttp_retry", "aiohttp", "shazamio", "shazamio_core",
+                  "shazamio.request"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # Load config
     cfg = load_config(args.config)
