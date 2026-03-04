@@ -1,7 +1,7 @@
 """Spindle display driver — Waveshare 3.5" IPS LCD (480×320, /dev/fb0).
 
-Full-bleed album art with gradient text overlay. Writes RGB565 to the
-framebuffer with ILI9486 colour-inversion compensation (XOR 0xFFFF).
+Split layout: album art left, text panel right on solid dark background.
+Writes RGB565 to the framebuffer with ILI9486 colour-inversion (XOR 0xFFFF).
 """
 
 import io
@@ -25,7 +25,15 @@ logger = logging.getLogger(__name__)
 
 WIDTH = 480
 HEIGHT = 320
-BG = (12, 12, 12)
+BG = (10, 10, 10)
+
+# Layout constants
+ART_SIZE = 260
+ART_X = 20
+ART_Y = (HEIGHT - ART_SIZE) // 2  # vertically centred = 30
+
+TEXT_X = ART_X + ART_SIZE + 16     # 296
+TEXT_W = WIDTH - TEXT_X - 12       # 172
 
 _FONT_PATHS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -50,36 +58,10 @@ def _to_fb(img: Any) -> bytes:
 
 
 def _enhance(img: Any) -> Any:
-    """Boost saturation, contrast and sharpness for washed-out SPI TFTs."""
-    img = ImageEnhance.Color(img).enhance(1.25)       # +25% saturation
-    img = ImageEnhance.Contrast(img).enhance(1.15)     # +15% contrast
-    img = ImageEnhance.Sharpness(img).enhance(1.1)     # +10% sharpness
+    """Boost saturation + contrast for washed-out SPI TFTs."""
+    img = ImageEnhance.Color(img).enhance(1.25)
+    img = ImageEnhance.Contrast(img).enhance(1.15)
     return img
-
-
-def _cover_crop(img: Any, tw: int, th: int) -> Any:
-    """Scale + centre-crop to exactly tw×th."""
-    src_r = img.width / img.height
-    tgt_r = tw / th
-    if src_r < tgt_r:
-        nw, nh = tw, int(tw / src_r)
-    else:
-        nw, nh = int(th * src_r), th
-    img = img.resize((nw, nh), _LANCZOS)
-    x, y = (nw - tw) // 2, (nh - th) // 2
-    return img.crop((x, y, x + tw, y + th))
-
-
-def _apply_gradient(img: Any,
-                    start_frac: float = 0.30,
-                    end_opacity: float = 0.06) -> Any:
-    """Darken bottom portion of the image with a smooth gradient."""
-    arr = np.array(img, dtype=np.float32)
-    start = int(HEIGHT * start_frac)
-    h = HEIGHT - start
-    factors = np.linspace(1.0, end_opacity, h)[:, None, None]
-    arr[start:] *= factors
-    return Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
 
 def _truncate(text: str, draw: Any, font: Any, max_w: int) -> str:
@@ -92,10 +74,28 @@ def _truncate(text: str, draw: Any, font: Any, max_w: int) -> str:
     return text
 
 
-def _plain_text(draw: Any, x: int, y: int,
-                text: str, font: Any, fill: Any, **kw: Any) -> None:
-    """Draw plain text, no effects."""
-    draw.text((x, y), text, fill=fill, font=font, **kw)
+def _wrap(text: str, draw: Any, font: Any, max_w: int,
+          max_lines: int = 2) -> list:
+    """Word-wrap text into lines."""
+    words = text.split()
+    lines: list = []
+    current = ""
+    for word in words:
+        test = (current + " " + word).strip()
+        if draw.textlength(test, font=font) <= max_w:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+        if len(lines) >= max_lines:
+            break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    # Truncate last line if it overflows
+    if lines:
+        lines[-1] = _truncate(lines[-1], draw, font, max_w)
+    return lines[:max_lines]
 
 
 class Display:
@@ -120,9 +120,9 @@ class Display:
         fp = _find_font()
         if fp:
             self._fonts = {
-                "title":      ImageFont.truetype(fp, 28),
-                "artist":     ImageFont.truetype(fp, 20),
-                "album":      ImageFont.truetype(fp, 15),
+                "title":      ImageFont.truetype(fp, 21),
+                "artist":     ImageFont.truetype(fp, 16),
+                "album":      ImageFont.truetype(fp, 13),
                 "idle_big":   ImageFont.truetype(fp, 32),
                 "idle_small": ImageFont.truetype(fp, 16),
             }
@@ -141,7 +141,6 @@ class Display:
 
     def show_track(self, track: TrackInfo, cover_art: Optional[bytes] = None,
                    track_number: int = 0, side: str = "") -> None:
-        """Render track info. Skips redraw if same track is already shown."""
         if not self.enabled:
             return
         key = (track.artist, track.title)
@@ -191,44 +190,59 @@ class Display:
     def _render_track(self, track: TrackInfo, cover_art: Optional[bytes],
                       track_number: int, side: str) -> Any:
         img = Image.new("RGB", (WIDTH, HEIGHT), BG)
+        draw = ImageDraw.Draw(img)
 
-        # ── Full-bleed album art ─────────────────────────────────────
+        # ── Album art (left) ─────────────────────────────────────────
         if cover_art:
             try:
                 art = Image.open(io.BytesIO(cover_art)).convert("RGB")
-                art = _cover_crop(art, WIDTH, HEIGHT)
+                art = art.resize((ART_SIZE, ART_SIZE), _LANCZOS)
                 art = _enhance(art)
-                img.paste(art, (0, 0))
+                img.paste(art, (ART_X, ART_Y))
             except Exception:
-                pass
+                self._draw_art_placeholder(draw)
+        else:
+            self._draw_art_placeholder(draw)
 
-        # ── Gradient overlay (darken bottom for text) ────────────────
-        img = _apply_gradient(img, start_frac=0.25, end_opacity=0.03)
-        draw = ImageDraw.Draw(img)
+        # ── Text panel (right, solid dark background) ────────────────
+        y = ART_Y + 10
 
-        pad = 18
-        max_w = WIDTH - 2 * pad
+        # Artist
+        artist_text = _truncate(track.artist or "", draw,
+                                self._fonts["artist"], TEXT_W)
+        draw.text((TEXT_X, y), artist_text,
+                  fill=(160, 160, 160), font=self._fonts["artist"])
+        y += 24
 
-        # Build text bottom-up
-        y = HEIGHT - pad
+        # Title (word-wrapped, up to 3 lines)
+        title_lines = _wrap(track.title or "", draw,
+                            self._fonts["title"], TEXT_W, max_lines=3)
+        for line in title_lines:
+            draw.text((TEXT_X, y), line,
+                      fill=(255, 255, 255), font=self._fonts["title"])
+            y += 26
+        y += 8
 
         # Album
         if track.album:
-            y -= 20
-            txt = _truncate(track.album, draw, self._fonts["album"], max_w)
-            _plain_text(draw, pad, y, txt, self._fonts["album"], (170, 170, 170))
+            album_text = _truncate(track.album, draw,
+                                   self._fonts["album"], TEXT_W)
+            draw.text((TEXT_X, y), album_text,
+                      fill=(100, 100, 100), font=self._fonts["album"])
+            y += 20
 
-        # Title
-        y -= 34
-        txt = _truncate(track.title or "", draw, self._fonts["title"], max_w)
-        _plain_text(draw, pad, y, txt, self._fonts["title"], (255, 255, 255))
-
-        # Artist
-        y -= 26
-        txt = _truncate(track.artist or "", draw, self._fonts["artist"], max_w)
-        _plain_text(draw, pad, y, txt, self._fonts["artist"], (210, 210, 210))
+        # Track number
+        if track_number:
+            draw.text((TEXT_X, y), f"Track {track_number}",
+                      fill=(60, 60, 60), font=self._fonts["album"])
 
         return img
+
+    def _draw_art_placeholder(self, draw: Any) -> None:
+        draw.rectangle([ART_X, ART_Y, ART_X + ART_SIZE, ART_Y + ART_SIZE],
+                       fill=(25, 25, 25))
+        draw.text((ART_X + ART_SIZE // 2, ART_Y + ART_SIZE // 2), "♫",
+                  fill=(50, 50, 50), font=self._fonts["title"], anchor="mm")
 
     # ------------------------------------------------------------------
     # Framebuffer
