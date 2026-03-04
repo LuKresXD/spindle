@@ -49,6 +49,11 @@ class SlidingCapture:
             audio_cfg.chunk_duration, step, self.num_segments,
         )
 
+    @property
+    def is_full(self) -> bool:
+        """True when the buffer has enough segments for a full window."""
+        return len(self._segments) >= self.num_segments
+
     def capture(self) -> Path:
         """Record one step and return a WAV of the full sliding window."""
         segment = self._record_segment()

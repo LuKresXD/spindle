@@ -283,8 +283,12 @@ def main():
                             )
 
                 # ============================================================
-                #  FINGERPRINT
+                #  FINGERPRINT (skip until buffer is full for quality)
                 # ============================================================
+                if not capture.is_full:
+                    logger.debug("Buffer filling (%d/%d segments)",
+                                 len(capture._segments), capture.num_segments)
+                    continue
                 track = identify(wav_path, cfg.acoustid, cfg.fingerprint)
 
                 # No match — if album-locked, trust the prediction
