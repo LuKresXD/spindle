@@ -1,19 +1,28 @@
-"""Album-lock scrobbling — predict and scrobble tracks based on album tracklist.
+"""Album-lock v2: anchor-based track prediction for vinyl scrobbling.
 
-When a track is identified, we "lock" onto the album and use the tracklist
-+ durations to predict upcoming tracks. If fingerprinting misses on subsequent
-chunks, we scrobble based on timing alone (because vinyl plays in order).
+Core concept:
+  Vinyl plays tracks in order. When we identify ANY track on an album, we can
+  infer what played before (retroactive backfill) and predict what comes next
+  (forward tracking). Multiple identifications strengthen confidence.
 
-Key feature: retroactive backfill. If tracks 1-4 weren't identified but track 5
-is, we calculate how long music has been playing and walk backwards through the
-tracklist to scrobble the tracks that must have played.
+Algorithm:
+  1. First identification → lock onto album, backfill previous tracks using
+     elapsed time since music started, then track forward by duration timing.
+  2. Subsequent IDs (same album) → fill gaps between prediction and reality.
+  3. No identification (while locked) → trust timing predictions.
+  4. Silence → end session, scrobble current track if eligible.
+  5. Different album ID → end current session, start fresh.
 
-Silence breaks the lock (record flip or end of side).
+Vinyl-aware timing:
+  - Speed varies ±3% (wow/flutter, off-center pressings, motor drift)
+  - Inter-track gaps ~1-2s (lead-in grooves)
+  - Needle drop precision ~±15s
+  - Track durations range from ~20s to 13+ min — no assumptions
 """
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .fingerprint import TrackInfo
@@ -21,283 +30,326 @@ from .spotify import SpotifyClient, SpotifyTrack, AlbumTracklist
 
 logger = logging.getLogger(__name__)
 
-# Tolerance for timing drift when matching retroactive backfill (seconds).
-# Accounts for needle-drop imprecision, lead-in groove, etc.
-BACKFILL_TOLERANCE = 15
+# --- Timing constants ---
+VINYL_DRIFT = 0.03        # ±3% speed tolerance
+NEEDLE_TOLERANCE = 15     # seconds of needle-drop imprecision
+ADVANCE_BUFFER_MIN = 3    # min seconds past duration before auto-advance
+ADVANCE_BUFFER_MAX = 15   # max seconds past duration before auto-advance
 
 
 @dataclass
-class AlbumLockState:
-    """Current album-lock state."""
+class Anchor:
+    """A confirmed fingerprint identification at a known time."""
+    track_index: int
+    timestamp: float
+
+
+@dataclass
+class Session:
+    """State for one continuous music session (silence → silence)."""
     album_id: str
     tracklist: AlbumTracklist
-    current_index: int  # 0-based index in tracklist
-    track_start_time: float  # when the current track started playing
-    scrobbled_indices: set  # tracks already scrobbled in this session
+    music_start: float                        # first non-silence timestamp
+    anchors: list = field(default_factory=list)
+    current_index: int = 0                    # best estimate of current track
+    current_track_start: float = 0.0          # estimated start of current track
+    scrobbled: set = field(default_factory=set)
     locked: bool = True
 
 
 class AlbumLock:
-    """Manages album-lock scrobbling state."""
+    """Manages album-lock scrobbling across vinyl sessions."""
 
-    def __init__(self, spotify: SpotifyClient, min_play_seconds: int = 30):
+    def __init__(self, spotify: SpotifyClient, min_play_seconds: int = 30,
+                 chunk_duration: int = 10):
         self.spotify = spotify
         self.min_play_seconds = min_play_seconds
-        self.state: Optional[AlbumLockState] = None
+        self.chunk_duration = chunk_duration
+        self.session: Optional[Session] = None
+
+    # ------------------------------------------------------------------ #
+    #  Public API — all return list[(TrackInfo, scrobble_timestamp)]       #
+    # ------------------------------------------------------------------ #
 
     def on_track_identified(
         self,
         spotify_track: SpotifyTrack,
-        music_start_time: Optional[float] = None,
-    ) -> Optional[list[tuple[TrackInfo, float]]]:
-        """Called when a track is identified via fingerprint + Spotify lookup.
+        music_start_time: float,
+    ) -> list[tuple[TrackInfo, float]]:
+        """Handle a fingerprint match. Returns tracks to scrobble."""
 
-        Args:
-            spotify_track: The identified track with album metadata.
-            music_start_time: When music first started playing (first non-silence
-                chunk after silence). Used for retroactive backfill on first lock.
-
-        Returns a list of (TrackInfo, timestamp) tuples to scrobble
-        (may include backfilled tracks), or None if nothing to scrobble yet.
-        """
         album_id = spotify_track.album_id
         if not album_id:
-            return None
+            return []
 
-        # Get album tracklist
         tracklist = self.spotify.get_album_tracklist(album_id)
         if not tracklist or not tracklist.tracks:
-            return None
+            return []
 
-        # Find the identified track's position
         track_index = tracklist.find_track_index(spotify_track.track.title)
         if track_index is None:
-            logger.debug("Track '%s' not found in album tracklist", spotify_track.track.title)
-            return None
+            logger.debug("Track '%s' not in tracklist for %s",
+                         spotify_track.track.title, tracklist.album_name)
+            return []
 
-        to_scrobble = []
         now = time.time()
+        to_scrobble: list[tuple[TrackInfo, float]] = []
 
-        if self.state and self.state.album_id == album_id and self.state.locked:
-            # Same album — check if this confirms our prediction or we need to catch up
-            expected_index = self._predicted_index(now)
+        # --- New session (first ID, different album, or session ended) ---
+        if not self.session or self.session.album_id != album_id or not self.session.locked:
+            # Finalize previous session
+            if self.session and self.session.locked:
+                to_scrobble.extend(self._end_session())
 
-            if track_index == expected_index or track_index == self.state.current_index:
-                logger.debug("Album-lock confirmed: track %d", track_index + 1)
-            elif track_index > self.state.current_index:
-                # We're ahead — backfill any skipped tracks with estimated timestamps
-                backfilled = self._backfill(self.state.current_index, track_index)
-                ts = self.state.track_start_time
-                for bf in backfilled:
-                    to_scrobble.append((bf, ts))
-                    ts += bf.duration or 180
-                logger.info(
-                    "Album-lock: jumped from track %d to %d, backfilling %d tracks",
-                    self.state.current_index + 1, track_index + 1, len(backfilled),
-                )
-            else:
-                # Track went backwards — break lock and re-lock
-                logger.info("Album-lock: track went backwards (%d → %d), re-locking",
-                            self.state.current_index + 1, track_index + 1)
-                self.state = None
+            self.session = Session(
+                album_id=album_id,
+                tracklist=tracklist,
+                music_start=music_start_time,
+                anchors=[Anchor(track_index, now)],
+                current_index=track_index,
+                current_track_start=now,  # refined by retroactive backfill
+            )
 
-        if not self.state or self.state.album_id != album_id:
-            # New album lock — attempt retroactive backfill
             logger.info(
-                "Album-lock: locked onto %s — %s (track %d/%d)",
+                "Album-lock: 🔒 %s — %s (track %d/%d)",
                 tracklist.artist, tracklist.album_name,
                 track_index + 1, len(tracklist.tracks),
             )
 
-            self.state = AlbumLockState(
-                album_id=album_id,
-                tracklist=tracklist,
-                current_index=track_index,
-                track_start_time=now,
-                scrobbled_indices=set(),
+            # Retroactive backfill: what played before this anchor?
+            backfill = self._retroactive_backfill(track_index, now)
+            to_scrobble.extend(backfill)
+            return to_scrobble
+
+        # --- Same album, still locked ---
+        self.session.anchors.append(Anchor(track_index, now))
+
+        if track_index == self.session.current_index:
+            logger.debug("Album-lock: anchor confirms track %d ✓", track_index + 1)
+            return []
+
+        if track_index > self.session.current_index:
+            # Ahead of prediction — fill the gap
+            gap = self._fill_forward(self.session.current_index, track_index)
+            to_scrobble.extend(gap)
+            self.session.current_index = track_index
+            self.session.current_track_start = now
+            logger.info(
+                "Album-lock: anchor → track %d (filled %d gap tracks)",
+                track_index + 1, len(gap),
             )
+            return to_scrobble
 
-            # Retroactive backfill: figure out what played before identification
-            if music_start_time and track_index > 0:
-                retro = self._retroactive_backfill(track_index, now, music_start_time)
-                if retro:
-                    to_scrobble.extend(retro)
-        else:
-            # Update position
-            self.state.current_index = track_index
-            self.state.track_start_time = now
-
-        return to_scrobble if to_scrobble else None
-
-    def _retroactive_backfill(
-        self,
-        identified_index: int,
-        now: float,
-        music_start_time: float,
-    ) -> list[tuple[TrackInfo, float]]:
-        """Walk backwards from the identified track to backfill previous tracks.
-
-        Uses the elapsed music time to determine how many tracks fit.
-        Returns (TrackInfo, timestamp) tuples.
-        """
-        if not self.state:
-            return []
-
-        elapsed = now - music_start_time
-        tracklist = self.state.tracklist
-
-        # Calculate how long the identified track has been playing.
-        # The identified track started at: now - (time into this track)
-        # We need to figure out how far into it we are.
-        # The remaining elapsed time before this track = elapsed - time_into_current
-        # We don't know time_into_current exactly, but we can estimate:
-        # Walk backwards, summing durations. If tracks 1..N-1 fit, backfill them.
-
-        # Sum durations of tracks before the identified one, walking backwards
-        candidates = []
-        cumulative = 0.0
-
-        for i in range(identified_index - 1, -1, -1):
-            track = tracklist.get_track_at(i)
-            if not track or not track.duration:
-                break  # Can't backfill past a track with unknown duration
-            cumulative += track.duration
-            if cumulative > elapsed + BACKFILL_TOLERANCE:
-                break  # This track doesn't fit in the elapsed time
-            candidates.append((i, track))
-
-        if not candidates:
-            return []
-
-        # Reverse so they're in play order
-        candidates.reverse()
-
-        # Calculate scrobble timestamps retroactively
-        to_scrobble = []
-        ts = music_start_time
-
-        for i, track in candidates:
-            if track.duration >= self.min_play_seconds:
-                to_scrobble.append((track, ts))
-                self.state.scrobbled_indices.add(i)
-            ts += track.duration
-
-        logger.info(
-            "Album-lock retroactive backfill: %d tracks (%.0fs of music before identification)",
-            len(to_scrobble), elapsed,
+        # Behind prediction — re-sync (drift or false positive earlier)
+        logger.warning(
+            "Album-lock: anchor behind prediction (%d < %d), re-syncing",
+            track_index + 1, self.session.current_index + 1,
         )
-        for track, t in to_scrobble:
-            logger.info("  ↳ backfill: %s — %s (ts=%.0f)", track.artist, track.title, t)
+        self.session.current_index = track_index
+        self.session.current_track_start = now
+        return []
+
+    def check_advance(self) -> list[tuple[TrackInfo, float]]:
+        """Check if current track ended by timing. Call every chunk.
+
+        Auto-advances to the next track and returns the just-finished track
+        for scrobbling. Buffer scales with track duration (vinyl speed drift).
+        """
+        if not self.session or not self.session.locked:
+            return []
+
+        current = self.session.tracklist.get_track_at(self.session.current_index)
+        if not current or not current.duration:
+            return []
+
+        elapsed = time.time() - self.session.current_track_start
+
+        # Buffer: 3% of duration, clamped to [3s, 15s]
+        buffer = min(max(current.duration * VINYL_DRIFT, ADVANCE_BUFFER_MIN),
+                     ADVANCE_BUFFER_MAX)
+
+        if elapsed < current.duration + buffer:
+            return []
+
+        to_scrobble: list[tuple[TrackInfo, float]] = []
+
+        # Scrobble current (fully played) track
+        if (self.session.current_index not in self.session.scrobbled
+                and current.duration >= self.min_play_seconds):
+            to_scrobble.append((current, self.session.current_track_start))
+            self.session.scrobbled.add(self.session.current_index)
+
+        # Advance to next track
+        next_idx = self.session.current_index + 1
+        next_track = self.session.tracklist.get_track_at(next_idx)
+
+        if next_track:
+            self.session.current_index = next_idx
+            self.session.current_track_start = time.time()
+            logger.info(
+                "Album-lock: → track %d — %s — %s",
+                next_idx + 1, next_track.artist, next_track.title,
+            )
+        else:
+            logger.info("Album-lock: end of tracklist reached")
+            self.session.locked = False
 
         return to_scrobble
 
-    def check_advance(self) -> Optional[TrackInfo]:
-        """Called on each chunk to check if the current track has ended by timing.
+    def on_silence(self) -> list[tuple[TrackInfo, float]]:
+        """Handle silence detection. Ends the session."""
+        return self._end_session()
 
-        If the track duration has elapsed, advance to the next track and return
-        the completed track for scrobbling. Returns None if no advance needed.
-        """
-        if not self.state or not self.state.locked:
+    def get_current_track(self) -> Optional[TrackInfo]:
+        """Currently predicted track (for now-playing / display)."""
+        if not self.session or not self.session.locked:
             return None
+        return self.session.tracklist.get_track_at(self.session.current_index)
 
-        current = self.state.tracklist.get_track_at(self.state.current_index)
+    def get_progress(self) -> Optional[tuple[float, float]]:
+        """(elapsed, total_duration) for current track, or None."""
+        if not self.session or not self.session.locked:
+            return None
+        current = self.session.tracklist.get_track_at(self.session.current_index)
         if not current or not current.duration:
             return None
-
-        elapsed = time.time() - self.state.track_start_time
-
-        # Has the current track finished? (with a small buffer for timing drift)
-        if elapsed >= current.duration + 2:
-            to_scrobble = None
-            if self.state.current_index not in self.state.scrobbled_indices:
-                if elapsed >= self.min_play_seconds:
-                    to_scrobble = current
-                    self.state.scrobbled_indices.add(self.state.current_index)
-
-            # Advance to next track
-            next_index = self.state.current_index + 1
-            next_track = self.state.tracklist.get_track_at(next_index)
-
-            if next_track:
-                self.state.current_index = next_index
-                self.state.track_start_time = time.time()
-                logger.info(
-                    "Album-lock: auto-advanced to track %d — %s — %s",
-                    next_index + 1, next_track.artist, next_track.title,
-                )
-                return to_scrobble
-            else:
-                logger.info("Album-lock: end of album reached")
-                self.state.locked = False
-                return to_scrobble
-
-        return None
-
-    def get_predicted_track(self) -> Optional[TrackInfo]:
-        """Get the currently predicted track (for display/now-playing updates)."""
-        if not self.state or not self.state.locked:
-            return None
-        return self.state.tracklist.get_track_at(self.state.current_index)
-
-    def on_silence(self) -> Optional[TrackInfo]:
-        """Called when silence is detected. Breaks the lock.
-
-        Returns the current track for scrobbling if it played long enough.
-        """
-        if not self.state or not self.state.locked:
-            return None
-
-        to_scrobble = None
-        current = self.state.tracklist.get_track_at(self.state.current_index)
-        elapsed = time.time() - self.state.track_start_time
-
-        if (current and self.state.current_index not in self.state.scrobbled_indices
-                and elapsed >= self.min_play_seconds):
-            to_scrobble = current
-            self.state.scrobbled_indices.add(self.state.current_index)
-
-        logger.info("Album-lock: broken by silence (record flip or end of side)")
-        self.state.locked = False
-        return to_scrobble
+        elapsed = time.time() - self.session.current_track_start
+        return (min(elapsed, current.duration), current.duration)
 
     def is_locked(self) -> bool:
-        return bool(self.state and self.state.locked)
+        return bool(self.session and self.session.locked)
 
     def reset(self):
-        """Fully reset the album lock."""
-        self.state = None
+        self.session = None
 
-    def _predicted_index(self, now: float) -> int:
-        """Predict which track should be playing based on elapsed time."""
-        if not self.state:
-            return 0
+    # ------------------------------------------------------------------ #
+    #  Internals                                                          #
+    # ------------------------------------------------------------------ #
 
-        elapsed = now - self.state.track_start_time
-        index = self.state.current_index
-        cumulative = 0.0
-
-        while index < len(self.state.tracklist.tracks):
-            track = self.state.tracklist.tracks[index]
-            if track.duration:
-                cumulative += track.duration
-                if elapsed < cumulative:
-                    return index
-            index += 1
-
-        return min(index, len(self.state.tracklist.tracks) - 1)
-
-    def _backfill(self, from_index: int, to_index: int) -> list[TrackInfo]:
-        """Generate scrobbles for tracks between from_index and to_index."""
-        if not self.state:
+    def _end_session(self) -> list[tuple[TrackInfo, float]]:
+        """End current session. Returns final track if it played long enough."""
+        if not self.session or not self.session.locked:
             return []
 
-        to_scrobble = []
-        for i in range(from_index, to_index):
-            if i in self.state.scrobbled_indices:
-                continue
-            track = self.state.tracklist.get_track_at(i)
-            if track and track.duration and track.duration >= self.min_play_seconds:
-                to_scrobble.append(track)
-                self.state.scrobbled_indices.add(i)
+        result: list[tuple[TrackInfo, float]] = []
+        current = self.session.tracklist.get_track_at(self.session.current_index)
+        elapsed = time.time() - self.session.current_track_start
 
-        return to_scrobble
+        if (current and self.session.current_index not in self.session.scrobbled
+                and elapsed >= self.min_play_seconds):
+            result.append((current, self.session.current_track_start))
+            self.session.scrobbled.add(self.session.current_index)
+
+        logger.info("Album-lock: 🔓 session ended")
+        self.session.locked = False
+        return result
+
+    def _retroactive_backfill(
+        self, anchor_index: int, anchor_time: float,
+    ) -> list[tuple[TrackInfo, float]]:
+        """Backfill tracks before the first anchor using elapsed time.
+
+        Logic:
+          elapsed = anchor_time − music_start
+          Walk backwards from anchor−1. For each candidate start track,
+          sum durations[start..anchor−1]. The remainder (elapsed − sum)
+          is the estimated time-into-anchor. Accept if remainder is
+          between 0 and anchor.duration (with tolerance).
+
+        This correctly handles:
+          - Needle dropped at track 1 → all prior tracks backfilled
+          - Needle dropped mid-album → only tracks from drop point
+          - Tracks with wildly different durations (20s to 13min)
+        """
+        if not self.session or anchor_index == 0:
+            return []
+
+        elapsed = anchor_time - self.session.music_start
+        if elapsed < self.chunk_duration:
+            # Less than one chunk — anchor is essentially the first track
+            return []
+
+        tracklist = self.session.tracklist
+        tolerance = elapsed * VINYL_DRIFT + NEEDLE_TOLERANCE
+
+        anchor_track = tracklist.get_track_at(anchor_index)
+        anchor_dur = (anchor_track.duration if anchor_track and anchor_track.duration
+                      else 600)  # generous fallback
+
+        # Walk backwards — find the earliest track that fits
+        cumulative = 0.0
+        best_start = anchor_index  # default: nothing to backfill
+
+        for i in range(anchor_index - 1, -1, -1):
+            track = tracklist.get_track_at(i)
+            if not track or not track.duration:
+                break  # can't reason past unknown durations
+
+            cumulative += track.duration
+
+            # Time we've been in the anchor track = elapsed − cumulative
+            time_into_anchor = elapsed - cumulative
+
+            # Valid if time_into_anchor ∈ [−tolerance, anchor_dur + tolerance]
+            if time_into_anchor >= -tolerance and time_into_anchor <= anchor_dur + tolerance:
+                best_start = i
+
+            if cumulative > elapsed + tolerance:
+                break  # no point going further
+
+        if best_start >= anchor_index:
+            return []
+
+        # Build scrobble list with reconstructed timestamps
+        result: list[tuple[TrackInfo, float]] = []
+        ts = self.session.music_start
+
+        for i in range(best_start, anchor_index):
+            track = tracklist.get_track_at(i)
+            if not track:
+                break
+            if track.duration and track.duration >= self.min_play_seconds:
+                result.append((track, ts))
+                self.session.scrobbled.add(i)
+            ts += track.duration if track.duration else 0
+
+        # Refine current_track_start: anchor track started at music_start + Σ(prior durations)
+        self.session.current_track_start = ts
+
+        logger.info(
+            "Album-lock: retroactive backfill — %d tracks starting from track %d "
+            "(%.0fs music before identification)",
+            len(result), best_start + 1, elapsed,
+        )
+        for track, t in result:
+            logger.info("  ↳ %s — %s", track.artist, track.title)
+
+        return result
+
+    def _fill_forward(
+        self, from_index: int, to_index: int,
+    ) -> list[tuple[TrackInfo, float]]:
+        """Fill tracks from from_index up to (not including) to_index.
+
+        Used when a new anchor is ahead of our prediction. All intermediate
+        tracks must have played fully (vinyl plays in order), so scrobble them.
+        """
+        if not self.session:
+            return []
+
+        result: list[tuple[TrackInfo, float]] = []
+        ts = self.session.current_track_start
+
+        for i in range(from_index, to_index):
+            track = self.session.tracklist.get_track_at(i)
+            if not track:
+                break
+
+            if i not in self.session.scrobbled:
+                if track.duration and track.duration >= self.min_play_seconds:
+                    result.append((track, ts))
+                    self.session.scrobbled.add(i)
+
+            ts += track.duration if track.duration else 0
+
+        return result
