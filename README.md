@@ -31,9 +31,11 @@ Spindle records audio from a USB adapter in short chunks, fingerprints each chun
 ### Key features
 
 - **Dual fingerprinting** — [AcoustID](https://acoustid.org) (Chromaprint) primary, [ShazamIO](https://github.com/dotX12/shazamio) fallback. Catches everything from mainstream to niche.
+- **Sliding window capture** — Records in 2-second steps with 10-second overlapping windows. New fingerprint attempt every 2 seconds for fast identification without sacrificing audio quality.
 - **Album-lock** — Identify one track, scrobble the whole side. Uses Spotify's tracklist + track durations to predict and scrobble tracks even when fingerprinting misses. Retroactively backfills tracks that played before the first identification.
 - **Spotify-canonical names** — Scrobbles use Spotify's formatting (e.g., `Playboi Carti — Poke It Out (with Nicki Minaj)`) so they stack with Spotify plays on Last.fm.
 - **Offline queue** — WiFi drops? Scrobbles are saved locally and flushed when the connection is back. Survives reboots.
+- **Telegram bot** — Live notifications when album-lock activates, tracks advance, and sides finish. Interactive commands: `/status`, `/history`, `/stats`.
 - **Vinyl-aware timing** — Accounts for ±3% speed drift, inter-track gaps, and needle-drop imprecision.
 - **30-second rule** — Respects Last.fm's scrobble spec: tracks must play ≥30s to count.
 - **systemd service** — Starts on boot, restarts on crash. Set it and forget it.
@@ -161,7 +163,8 @@ See [`config.example.yaml`](config.example.yaml) for all options. Key settings:
 ```yaml
 audio:
   device: "plughw:CARD=Device,DEV=0"
-  chunk_duration: 10        # seconds per fingerprint chunk
+  chunk_duration: 10        # fingerprint window size (seconds)
+  # Capture step is 2s — new window every 2s for fast identification
 
 silence:
   threshold_db: -22         # vinyl surface noise is ~-25 dB
@@ -170,6 +173,18 @@ silence:
 scrobble:
   min_play_seconds: 30      # Last.fm 30-second rule
   dedup_window: 300         # ignore same track within 5 min
+
+telegram:
+  bot_token: ""             # from @BotFather
+  chat_id: ""               # your Telegram chat ID
+  silent: false             # silent notifications
+  verbose: false            # notify on every scrobble
+  errors: true              # notify on errors
+
+logging:
+  file: ""                  # optional log file path
+  max_bytes: 5000000        # 5 MB rotation
+  backup_count: 3           # keep 3 rotated files
 ```
 
 ## Architecture
@@ -177,11 +192,14 @@ scrobble:
 ```
 spindle/
 ├── cli.py          # Main loop: capture → identify → scrobble
-├── capture.py      # Audio recording via arecord + silence detection
+├── capture.py      # Sliding window audio capture via arecord
 ├── fingerprint.py  # AcoustID + ShazamIO identification
 ├── spotify.py      # Spotify API: canonical names + album tracklists
 ├── albumlock.py    # Album-lock v2: anchor-based track prediction
 ├── scrobbler.py    # Last.fm scrobbling + offline queue
+├── history.py      # Scrobble history (JSONL log for stats)
+├── notify.py       # Telegram notifications
+├── bot.py          # Telegram bot command handler
 ├── config.py       # YAML config loader
 └── display.py      # LCD display (stub, coming soon)
 ```
@@ -194,8 +212,11 @@ spindle/
 - [x] Album-lock scrobbling with retroactive backfill
 - [x] Offline scrobble queue (survives WiFi drops + reboots)
 - [x] systemd service (autostart, auto-restart)
+- [x] Sliding window capture (2s step, 10s window)
+- [x] Telegram bot (notifications + `/status`, `/history`, `/stats`)
+- [x] Scrobble history + statistics
+- [x] Rotating log files
 - [ ] Waveshare 3.5" LCD display (album art, track info, progress)
-- [ ] Web dashboard (live status, scrobble history)
 
 ## License
 

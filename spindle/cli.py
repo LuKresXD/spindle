@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import load_config
-from .capture import capture_chunk, is_silence
+from .capture import SlidingCapture, is_silence, DEFAULT_STEP
 from .fingerprint import identify, TrackInfo
 from .scrobbler import Scrobbler, canonicalize_track
 from .display import Display
@@ -109,7 +109,7 @@ def main():
         album_lock = AlbumLock(
             spotify,
             min_play_seconds=cfg.scrobble.min_play_seconds,
-            chunk_duration=cfg.audio.chunk_duration,
+            chunk_duration=DEFAULT_STEP,
         )
         logger.info("Spotify lookup + album-lock enabled")
     else:
@@ -130,8 +130,11 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    # --- Sliding capture ---
+    capture = SlidingCapture(cfg.audio)
+
     logger.info("Listening on device: %s", cfg.audio.device)
-    logger.info("Chunk duration: %ds", cfg.audio.chunk_duration)
+    logger.info("Window: %ds, step: %ds", cfg.audio.chunk_duration, capture.step)
     # --- Telegram bot (command handler) ---
     bot = None
     if cfg.telegram.bot_token and cfg.telegram.chat_id and not args.dry_run:
@@ -199,7 +202,7 @@ def main():
 
     while _running:
         try:
-            wav_path = capture_chunk(cfg.audio)
+            wav_path = capture.capture()
 
             try:
                 # ============================================================
@@ -237,6 +240,7 @@ def main():
                         current_track = None
                         track_scrobbled = False
                         music_start_time = None
+                        capture.reset()
                         display.show_idle()
                     continue
 
@@ -244,9 +248,9 @@ def main():
                 #  MUSIC DETECTED — mark start time
                 # ============================================================
                 if consecutive_silence > 0 or music_start_time is None:
-                    # Music started DURING the chunk we just captured,
-                    # which was chunk_duration seconds ago.
-                    music_start_time = time.time() - cfg.audio.chunk_duration
+                    # Music started DURING the segment we just captured,
+                    # which was ~step seconds ago.
+                    music_start_time = time.time() - capture.step
                     logger.debug("Music started (est. %.0f)", music_start_time)
 
                 consecutive_silence = 0

@@ -56,8 +56,8 @@ class SpindleBot:
             try:
                 url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
                 resp = requests.get(url, params={
-                    "offset": self._offset,
-                    "timeout": 30,
+                    "offset": str(self._offset),
+                    "timeout": "30",
                     "allowed_updates": '["message"]',
                 }, timeout=35)
 
