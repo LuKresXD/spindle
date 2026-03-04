@@ -107,7 +107,9 @@ class AlbumLock:
                 music_start=music_start_time,
                 anchors=[Anchor(track_index, now)],
                 current_index=track_index,
-                current_track_start=now,  # refined by retroactive backfill
+                # Best estimate: music started → this track started.
+                # Retroactive backfill refines this further if prior tracks exist.
+                current_track_start=music_start_time,
             )
 
             logger.info(
