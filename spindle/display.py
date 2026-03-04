@@ -11,10 +11,14 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-
 from .fingerprint import TrackInfo
+
+try:
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    _HAS_DISPLAY_DEPS = True
+except ImportError:
+    _HAS_DISPLAY_DEPS = False
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +99,10 @@ class Display:
         """Load fonts and clear the display."""
         if not self.enabled:
             logger.debug("Display disabled — skipping init")
+            return
+        if not _HAS_DISPLAY_DEPS:
+            logger.warning("Display enabled but Pillow/numpy not installed — disabling")
+            self.enabled = False
             return
 
         font_path = _find_font()
