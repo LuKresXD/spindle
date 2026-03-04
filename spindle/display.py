@@ -120,9 +120,9 @@ class Display:
         fp = _find_font()
         if fp:
             self._fonts = {
-                "title":      ImageFont.truetype(fp, 21),
-                "artist":     ImageFont.truetype(fp, 16),
-                "album":      ImageFont.truetype(fp, 13),
+                "title":      ImageFont.truetype(fp, 30),
+                "artist":     ImageFont.truetype(fp, 20),
+                "album":      ImageFont.truetype(fp, 16),
                 "idle_big":   ImageFont.truetype(fp, 32),
                 "idle_small": ImageFont.truetype(fp, 16),
             }
@@ -191,58 +191,39 @@ class Display:
                       track_number: int, side: str) -> Any:
         img = Image.new("RGB", (WIDTH, HEIGHT), BG)
         draw = ImageDraw.Draw(img)
+        pad = 30
+        max_w = WIDTH - 2 * pad
+        cx = WIDTH // 2
 
-        # ── Album art (left) ─────────────────────────────────────────
-        if cover_art:
-            try:
-                art = Image.open(io.BytesIO(cover_art)).convert("RGB")
-                art = art.resize((ART_SIZE, ART_SIZE), _LANCZOS)
-                art = _enhance(art)
-                img.paste(art, (ART_X, ART_Y))
-            except Exception:
-                self._draw_art_placeholder(draw)
-        else:
-            self._draw_art_placeholder(draw)
-
-        # ── Text panel (right, solid dark background) ────────────────
-        y = ART_Y + 10
+        # Build from vertical centre — title is the anchor
+        title_lines = _wrap(track.title or "", draw,
+                            self._fonts["title"], max_w, max_lines=2)
+        title_h = len(title_lines) * 38
+        total_h = 28 + title_h + 8 + (20 if track.album else 0)
+        y = (HEIGHT - total_h) // 2
 
         # Artist
         artist_text = _truncate(track.artist or "", draw,
-                                self._fonts["artist"], TEXT_W)
-        draw.text((TEXT_X, y), artist_text,
-                  fill=(160, 160, 160), font=self._fonts["artist"])
-        y += 24
+                                self._fonts["artist"], max_w)
+        draw.text((cx, y), artist_text, fill=(150, 150, 150),
+                  font=self._fonts["artist"], anchor="mt")
+        y += 28
 
-        # Title (word-wrapped, up to 3 lines)
-        title_lines = _wrap(track.title or "", draw,
-                            self._fonts["title"], TEXT_W, max_lines=3)
+        # Title (large, white, centred)
         for line in title_lines:
-            draw.text((TEXT_X, y), line,
-                      fill=(255, 255, 255), font=self._fonts["title"])
-            y += 26
+            draw.text((cx, y), line, fill=(255, 255, 255),
+                      font=self._fonts["title"], anchor="mt")
+            y += 38
         y += 8
 
         # Album
         if track.album:
             album_text = _truncate(track.album, draw,
-                                   self._fonts["album"], TEXT_W)
-            draw.text((TEXT_X, y), album_text,
-                      fill=(100, 100, 100), font=self._fonts["album"])
-            y += 20
-
-        # Track number
-        if track_number:
-            draw.text((TEXT_X, y), f"Track {track_number}",
-                      fill=(60, 60, 60), font=self._fonts["album"])
+                                   self._fonts["album"], max_w)
+            draw.text((cx, y), album_text, fill=(90, 90, 90),
+                      font=self._fonts["album"], anchor="mt")
 
         return img
-
-    def _draw_art_placeholder(self, draw: Any) -> None:
-        draw.rectangle([ART_X, ART_Y, ART_X + ART_SIZE, ART_Y + ART_SIZE],
-                       fill=(25, 25, 25))
-        draw.text((ART_X + ART_SIZE // 2, ART_Y + ART_SIZE // 2), "♫",
-                  fill=(50, 50, 50), font=self._fonts["title"], anchor="mm")
 
     # ------------------------------------------------------------------
     # Framebuffer
