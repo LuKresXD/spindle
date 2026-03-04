@@ -92,11 +92,10 @@ def _truncate(text: str, draw: Any, font: Any, max_w: int) -> str:
     return text
 
 
-def _stroke_text(draw: Any, x: int, y: int,
-                 text: str, font: Any, fill: Any, **kw: Any) -> None:
-    """Draw text with a solid black stroke for clean readability."""
-    draw.text((x, y), text, fill=fill, font=font,
-              stroke_width=2, stroke_fill=(0, 0, 0), **kw)
+def _plain_text(draw: Any, x: int, y: int,
+                text: str, font: Any, fill: Any, **kw: Any) -> None:
+    """Draw plain text, no effects."""
+    draw.text((x, y), text, fill=fill, font=font, **kw)
 
 
 class Display:
@@ -217,17 +216,17 @@ class Display:
         if track.album:
             y -= 20
             txt = _truncate(track.album, draw, self._fonts["album"], max_w)
-            _stroke_text(draw, pad, y, txt, self._fonts["album"], (170, 170, 170))
+            _plain_text(draw, pad, y, txt, self._fonts["album"], (170, 170, 170))
 
         # Title
         y -= 34
         txt = _truncate(track.title or "", draw, self._fonts["title"], max_w)
-        _stroke_text(draw, pad, y, txt, self._fonts["title"], (255, 255, 255))
+        _plain_text(draw, pad, y, txt, self._fonts["title"], (255, 255, 255))
 
         # Artist
         y -= 26
         txt = _truncate(track.artist or "", draw, self._fonts["artist"], max_w)
-        _stroke_text(draw, pad, y, txt, self._fonts["artist"], (210, 210, 210))
+        _plain_text(draw, pad, y, txt, self._fonts["artist"], (210, 210, 210))
 
         return img
 
