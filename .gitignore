@@ -1,3 +1,6 @@
+# Config with real API keys
+config.yaml
+
 # Python
 __pycache__/
 *.py[cod]
@@ -6,13 +9,11 @@ __pycache__/
 dist/
 build/
 *.egg
+.eggs/
 
 # Virtual environment
 venv/
 .venv/
-
-# Config with secrets
-config.yaml
 
 # IDE
 .vscode/
@@ -24,10 +25,5 @@ config.yaml
 .DS_Store
 Thumbs.db
 
-# Audio test files
-*.wav
-*.mp3
-*.flac
-
-# Logs
-*.log
+# Scrobble queue (local state)
+scrobble_queue.json

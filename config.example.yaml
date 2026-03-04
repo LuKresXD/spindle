@@ -1,42 +1,42 @@
 # Spindle configuration
-# Copy to config.yaml and fill in your keys
+# Copy to config.yaml and fill in your API keys
 
 acoustid:
-  api_key: "your-acoustid-api-key"
+  api_key: "your-acoustid-api-key"         # https://acoustid.org/new-application
 
 spotify:
-  client_id: "your-spotify-client-id"
+  client_id: "your-spotify-client-id"       # https://developer.spotify.com/dashboard
   client_secret: "your-spotify-client-secret"
 
 lastfm:
-  api_key: "your-lastfm-api-key"
+  api_key: "your-lastfm-api-key"            # https://www.last.fm/api/account/create
   api_secret: "your-lastfm-shared-secret"
   username: "your-lastfm-username"
-  # password_hash: "md5-of-your-password"  # generated on first auth
+  # password_hash: "md5-of-your-password"   # run: python3 -c "import hashlib; print(hashlib.md5(b'YOUR_PASSWORD').hexdigest())"
 
 audio:
-  device: "plughw:CARD=Device,DEV=0"  # ALSA device
+  device: "plughw:CARD=Device,DEV=0"        # find yours: arecord -l
   sample_rate: 44100
-  channels: 2
-  chunk_duration: 25  # seconds per fingerprint chunk
+  channels: 2                               # stereo — important for ShazamIO accuracy
+  chunk_duration: 10                         # seconds per fingerprint chunk
 
 fingerprint:
-  acoustid_timeout: 10  # seconds
-  shazam_fallback: true
+  acoustid_timeout: 10
+  shazam_fallback: true                     # ShazamIO catches tracks AcoustID misses
   min_confidence: 0.5
 
 scrobble:
-  min_play_seconds: 30       # minimum before scrobbling
-  min_play_fraction: 0.5     # or 50% of track length
-  now_playing: true           # update "now playing" on Last.fm
-  dedup_window: 300           # ignore same track within 5 min
+  min_play_seconds: 30                      # Last.fm 30-second rule
+  min_play_fraction: 0.5                    # or 50% of track length
+  now_playing: true
+  dedup_window: 300                         # ignore same track within 5 min
 
 silence:
-  threshold_db: -40           # below this = silence
-  min_silence_seconds: 3      # gap between tracks
+  threshold_db: -22                         # vinyl surface noise is ~-25 dB
+  min_silence_seconds: 3
 
 display:
-  enabled: false              # enable when Waveshare LCD is connected
+  enabled: false                            # enable when LCD is connected
   width: 480
   height: 320
   spi_device: "/dev/spidev0.0"
