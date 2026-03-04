@@ -270,7 +270,7 @@ def main():
                         current_track = predicted
                         track_scrobbled = True
                         do_now_playing(predicted)
-                        pos, dur = album_lock.get_elapsed() or (0.0, 0.0)
+                        pos, dur = album_lock.get_progress() or (0.0, 0.0)
                         al = album_lock.session
                         display.show_track(
                             predicted,
