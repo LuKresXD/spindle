@@ -196,6 +196,8 @@ def main():
     music_start_time = None   # when music first started after silence
     consecutive_silence = 0
     chunks_since_identify = 0  # counter to throttle fingerprinting when locked
+    last_identified_key = None  # dedup: skip re-identifying the same track
+    same_track_count = 0  # how many times we've seen the same track in a row
 
     # ------------------------------------------------------------------ #
     #  Main loop                                                          #
@@ -241,6 +243,9 @@ def main():
                         current_track = None
                         track_scrobbled = False
                         music_start_time = None
+                        last_identified_key = None
+                        same_track_count = 0
+                        chunks_since_identify = 0
                         capture.reset()
                         display.show_idle()
                     continue
@@ -291,13 +296,23 @@ def main():
                                  len(capture._segments), capture.num_segments)
                     continue
 
-                # When album-locked, only fingerprint every ~30s (15 chunks × 2s)
-                # to confirm position. Saves CPU + API calls.
+                # Throttle fingerprinting:
+                # - When album-locked: only every ~30s (15 × 2s) to confirm
+                # - When same track keeps matching: back off progressively
                 chunks_since_identify += 1
-                if album_lock and album_lock.is_locked() and chunks_since_identify < 15:
-                    predicted = album_lock.get_current_track()
-                    if predicted:
-                        do_now_playing(predicted)
+
+                skip_threshold = 15 if (album_lock and album_lock.is_locked()) else (
+                    # Not locked: after identifying same track 3x, slow to every ~10s
+                    5 if same_track_count >= 3 else 0
+                )
+
+                if chunks_since_identify <= skip_threshold:
+                    if album_lock and album_lock.is_locked():
+                        predicted = album_lock.get_current_track()
+                        if predicted:
+                            do_now_playing(predicted)
+                    elif current_track:
+                        do_now_playing(current_track)
                     continue
 
                 track = identify(wav_path, cfg.acoustid, cfg.fingerprint)
@@ -305,11 +320,20 @@ def main():
 
                 # No match — if album-locked, trust the prediction
                 if not track:
+                    same_track_count = 0  # reset on miss
                     if album_lock and album_lock.is_locked():
                         predicted = album_lock.get_current_track()
                         if predicted:
                             do_now_playing(predicted)
                     continue
+
+                # Track dedup: count consecutive same-track identifications
+                tk = track_key(track)
+                if tk == last_identified_key:
+                    same_track_count += 1
+                else:
+                    same_track_count = 0
+                    last_identified_key = tk
 
                 # ============================================================
                 #  SPOTIFY LOOKUP

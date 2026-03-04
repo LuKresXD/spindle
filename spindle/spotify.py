@@ -63,7 +63,8 @@ class SpotifyClient:
         self._token: Optional[str] = None
         self._token_expiry: float = 0
         self._album_cache: dict[str, AlbumTracklist] = {}
-        self._lookup_cache: dict[str, Optional["SpotifyTrack"]] = {}  # artist-title → result
+        self._lookup_cache: dict[str, Optional["SpotifyTrack"]] = {}
+        self._backoff_until: float = 0  # rate limit backoff timestamp
 
     def _get_token(self) -> str:
         """Get (or refresh) a client credentials token."""
@@ -95,6 +96,11 @@ class SpotifyClient:
         cache_key = f"{artist.lower()}|||{title.lower()}"
         if cache_key in self._lookup_cache:
             return self._lookup_cache[cache_key]
+
+        # Rate limit backoff
+        if time.time() < self._backoff_until:
+            logger.debug("Spotify: backing off (rate limited)")
+            return None
 
         try:
             query = f"track:{title} artist:{artist}"
@@ -159,6 +165,14 @@ class SpotifyClient:
             self._lookup_cache[cache_key] = result
             return result
 
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                retry_after = int(e.response.headers.get("Retry-After", 30))
+                self._backoff_until = time.time() + retry_after
+                logger.warning("Spotify rate limited — backing off %ds", retry_after)
+            else:
+                logger.warning("Spotify lookup failed: %s", e)
+            return None
         except Exception as e:
             logger.warning("Spotify lookup failed: %s", e)
             return None
