@@ -114,7 +114,7 @@ class SpotifyClient:
             query = f"track:{clean_title} artist:{artist}"
             resp = requests.get(
                 SEARCH_URL,
-                params={"q": query, "type": "track", "limit": "5"},
+                params={"q": query, "type": "track", "limit": "10"},
                 headers=self._headers(),
                 timeout=10,
             )
@@ -127,19 +127,35 @@ class SpotifyClient:
                 self._lookup_cache[cache_key] = None
                 return None
 
-            # Find best match — prefer exact artist name match
-            best = None
-            for t in tracks:
-                spotify_artist = t["artists"][0]["name"]
-                if (
-                    artist.lower().split("&")[0].strip() in spotify_artist.lower()
-                    or spotify_artist.lower() in artist.lower()
-                ):
-                    best = t
-                    break
+            # --- Pick best match: artist match + prefer standard album edition ---
+            _EDITION_RE = re.compile(
+                r'\b(?:deluxe|super\s+deluxe|anniversary|remaster(?:ed)?|'
+                r'expanded|bonus|special\s+edition|'
+                r'\d{4}\s+(?:remaster|edition|mix))\b',
+                re.IGNORECASE,
+            )
 
-            if best is None:
-                best = tracks[0]
+            def _score(t: dict) -> tuple:
+                """Higher score = better match. Returns (artist_match, standard_album)."""
+                t_artist = t["artists"][0]["name"].lower()
+                a_lower = artist.lower()
+                artist_match = (
+                    a_lower.split("&")[0].strip() in t_artist
+                    or t_artist in a_lower
+                )
+                album_name = t.get("album", {}).get("name", "")
+                standard_album = not bool(_EDITION_RE.search(album_name))
+                return (int(artist_match), int(standard_album))
+
+            best = max(tracks, key=_score)
+
+            # Log if we overrode a deluxe edition
+            album_name_chosen = best.get("album", {}).get("name", "")
+            if _EDITION_RE.search(album_name_chosen):
+                logger.debug(
+                    "Spotify: all results are non-standard editions, using: %s",
+                    album_name_chosen,
+                )
 
             spotify_artist = best["artists"][0]["name"]
             spotify_title = best["name"]
