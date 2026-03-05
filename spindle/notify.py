@@ -71,11 +71,18 @@ class Notifier:
 
     def side_finished(self, artist: str, album: str,
                       tracks_scrobbled: int, total_played: int) -> None:
-        """Notify when a side/session ends."""
+        """Notify when an album side/session ends."""
         self._send(
             f"⏹ <b>Side finished</b>\n"
             f"{_esc(artist)} — <i>{_esc(album)}</i>\n"
             f"Scrobbled {tracks_scrobbled}/{total_played} tracks"
+        )
+
+    def compilation_finished(self, tracks_scrobbled: int) -> None:
+        """Notify when a compilation session ends."""
+        self._send(
+            f"⏹ <b>Compilation finished</b>\n"
+            f"Scrobbled {tracks_scrobbled} track{'s' if tracks_scrobbled != 1 else ''}"
         )
 
     def error(self, message: str) -> None:

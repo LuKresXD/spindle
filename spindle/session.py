@@ -39,10 +39,11 @@ from .spotify import SpotifyClient, SpotifyTrack, AlbumTracklist
 logger = logging.getLogger(__name__)
 
 # ── Timing constants ─────────────────────────────────────────────────────────
-VINYL_DRIFT        = 0.03   # ±3 % speed tolerance (wow/flutter/motor drift)
-NEEDLE_TOLERANCE   = 15     # seconds of needle-drop imprecision
-ADVANCE_BUFFER_MIN = 3      # min seconds past duration before auto-advance
-ADVANCE_BUFFER_MAX = 15     # max seconds past duration before auto-advance
+VINYL_DRIFT          = 0.03  # ±3 % speed tolerance (wow/flutter/motor drift)
+NEEDLE_TOLERANCE     = 15    # seconds of needle-drop imprecision
+ADVANCE_BUFFER_MIN   = 3     # min seconds past duration before auto-advance
+ADVANCE_BUFFER_MAX   = 15    # max seconds past duration before auto-advance
+FALLBACK_TRACK_DURATION = 240  # assumed duration (s) when Spotify has none (4 min)
 
 # ── Compilation detection ─────────────────────────────────────────────────────
 MISMATCH_THRESHOLD = 2      # consecutive off-album IDs → switch to COMPILATION
@@ -105,6 +106,7 @@ class AlbumState:
     current_index:       int   = 0       # best estimate of current track
     current_track_start: float = 0.0    # estimated wall-clock start of current track
     scrobbled:           set   = field(default_factory=set)  # track indices scrobbled
+    exhausted:           bool  = False   # True once we've advanced past the last track
 
 
 # ── Main class ────────────────────────────────────────────────────────────────
@@ -139,6 +141,7 @@ class ScrobbleSession:
 
         self._album: Optional[AlbumState] = None
         self._mismatch_count: int = 0
+        self._comp_count: int = 0  # tracks scrobbled in compilation mode this session
 
         # Session-wide dedup: (artist_lower, normalized_title)
         # Shared across mode switches; cleared only on silence.
@@ -149,6 +152,11 @@ class ScrobbleSession:
     @property
     def album_state(self) -> Optional[AlbumState]:
         return self._album
+
+    @property
+    def comp_scrobbled_count(self) -> int:
+        """Number of tracks scrobbled in compilation mode this session."""
+        return self._comp_count
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -163,6 +171,10 @@ class ScrobbleSession:
         The caller must also call check_advance() each chunk for
         timing-based track advances.
         """
+        # ── Compilation mode: no tracklist needed, just dedup + scrobble ────
+        if self.mode == SessionMode.COMPILATION:
+            return self._handle_compilation_id(spotify_track)
+
         album_id  = spotify_track.album_id
         if not album_id:
             return []
@@ -195,19 +207,23 @@ class ScrobbleSession:
 
         Returns any newly completed tracks to scrobble.
         """
-        if self.mode != SessionMode.ALBUM or not self._album:
+        if self.mode != SessionMode.ALBUM or not self._album or self._album.exhausted:
             return []
 
         current = self._album.tracklist.get_track_at(self._album.current_index)
-        if not current or not current.duration:
+        if not current:
             return []
+
+        # Use fallback duration when Spotify has no data (e.g. older releases).
+        # Without this, a None-duration track would block timing advance forever.
+        duration = current.duration or FALLBACK_TRACK_DURATION
 
         elapsed = time.time() - self._album.current_track_start
         buffer  = min(
-            max(current.duration * VINYL_DRIFT, ADVANCE_BUFFER_MIN),
+            max(duration * VINYL_DRIFT, ADVANCE_BUFFER_MIN),
             ADVANCE_BUFFER_MAX,
         )
-        if elapsed < current.duration + buffer:
+        if elapsed < duration + buffer:
             return []
 
         result: list[tuple[TrackInfo, float]] = []
@@ -229,9 +245,11 @@ class ScrobbleSession:
                 next_idx + 1, next_track.artist, next_track.title,
             )
         else:
-            logger.info("Session: end of tracklist reached, waiting for silence")
-            # Stay in album mode but mark album as exhausted
-            self._album.current_index = next_idx  # one past the end
+            # End of tracklist. Mark exhausted so check_advance short-circuits
+            # and is_locked() returns False — but on_identified() can still
+            # re-open the session if a side-B anchor arrives.
+            self._album.exhausted = True
+            logger.info("Session: end of tracklist — waiting for silence")
 
         return result
 
@@ -279,11 +297,11 @@ class ScrobbleSession:
         return (elapsed, current.duration)
 
     def is_locked(self) -> bool:
-        """True while in album mode with an active, in-bounds album session."""
+        """True while in album mode with a live (non-exhausted) album session."""
         return (
             self.mode == SessionMode.ALBUM
             and self._album is not None
-            and self._album.current_index < len(self._album.tracklist.tracks)
+            and not self._album.exhausted
         )
 
     def reset(self) -> None:
@@ -291,6 +309,7 @@ class ScrobbleSession:
         self.mode                = None
         self._album              = None
         self._mismatch_count     = 0
+        self._comp_count         = 0
         self._session_scrobbled.clear()
 
     # ── Session-level dedup ───────────────────────────────────────────────────
@@ -441,6 +460,7 @@ class ScrobbleSession:
         """Record a valid anchor and update album session state."""
         assert self._album is not None
         self._album.anchors.append(Anchor(track_index, now))
+        self._album.exhausted = False  # re-open if a side-B anchor arrives
 
         result: list[tuple[TrackInfo, float]] = []
 
@@ -559,7 +579,7 @@ class ScrobbleSession:
             if not track:
                 break
             result.extend(self._try_scrobble(i, ts))
-            ts += track.duration if track.duration else 0
+            ts += track.duration if track.duration else FALLBACK_TRACK_DURATION
 
         # Refine estimated start time for the anchor track itself
         self._album.current_track_start = ts
@@ -587,7 +607,10 @@ class ScrobbleSession:
             if not track:
                 break
             result.extend(self._try_scrobble(i, ts))
-            ts += track.duration if track.duration else 0
+            # Use fallback so the next track gets a distinct timestamp even
+            # when Spotify has no duration data — duplicate timestamps are
+            # silently rejected by Last.fm.
+            ts += track.duration if track.duration else FALLBACK_TRACK_DURATION
         return result
 
     # ── Compilation mode ──────────────────────────────────────────────────────
@@ -605,8 +628,10 @@ class ScrobbleSession:
         if track.duration and track.duration < self.min_play_seconds:
             return []
         self._mark_scrobbled(track)
+        self._comp_count += 1
         logger.info(
-            "Session: 🎛  COMPILATION scrobble — %s — %s", track.artist, track.title,
+            "Session: 🎛  COMPILATION scrobble #%d — %s — %s",
+            self._comp_count, track.artist, track.title,
         )
         return [(track, time.time())]
 

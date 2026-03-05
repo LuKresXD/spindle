@@ -211,19 +211,27 @@ def main():
 
                         # Smart session: finalize + reset
                         if session:
-                            al = session.album_state
+                            al          = session.album_state
                             al_artist   = al.tracklist.artist     if al else None
                             al_album    = al.tracklist.album_name if al else None
-                            al_count    = len(al.scrobbled)       if al else 0
+                            # Read comp count BEFORE on_silence() calls reset()
+                            comp_count  = session.comp_scrobbled_count
 
                             for t, ts in session.on_silence():
                                 do_scrobble(t, ts)
 
-                            if al_artist and al_count > 0:
-                                notifier.side_finished(
-                                    al_artist, al_album,
-                                    al_count, (al.current_index + 1) if al else 0,
-                                )
+                            # al ref still valid after reset (Python GC)
+                            if al_artist:
+                                # Album session: count includes track added by on_silence
+                                al_count = len(al.scrobbled) if al else 0
+                                if al_count > 0:
+                                    notifier.side_finished(
+                                        al_artist, al_album,
+                                        al_count, al.current_index + 1,
+                                    )
+                            elif comp_count > 0:
+                                # Compilation session
+                                notifier.compilation_finished(comp_count)
 
                         # Simple-mode fallback: finalize current track
                         if not session and current_track and not track_scrobbled:

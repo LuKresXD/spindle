@@ -20,6 +20,10 @@ DEFAULT_QUEUE_PATH = Path.home() / ".local" / "share" / "spindle" / "scrobble_qu
 # How often to attempt flushing the queue (seconds)
 QUEUE_FLUSH_INTERVAL = 60
 
+# Minimum gap between now-playing updates for the same track (seconds).
+# Without this, a 13-minute track triggers ~390 API calls (every 2s capture step).
+NOW_PLAYING_COOLDOWN = 30
+
 
 def canonicalize_track(track: TrackInfo, network: pylast.LastFMNetwork) -> TrackInfo:
     """Canonicalize artist/title using Last.fm corrections + proper caps + duration."""
@@ -148,6 +152,9 @@ class Scrobbler:
         self._last_scrobble_time: float = 0
         self._queue = ScrobbleQueue(queue_path)
         self._last_flush_attempt: float = 0
+        # Now-playing rate limiting
+        self._last_np_key: Optional[str] = None
+        self._last_np_time: float = 0
 
     def connect(self) -> None:
         if not self.cfg.api_key or not self.cfg.api_secret:
@@ -168,6 +175,14 @@ class Scrobbler:
         if not self.network or not self.scrobble_cfg.now_playing:
             return
 
+        # Rate-limit: skip if the same track was updated within the cooldown window.
+        # Prevents ~390 API calls per 13-minute track (one every 2s capture step).
+        np_key = f"{track.artist.lower()}|||{track.title.lower()}"
+        now    = time.time()
+        if np_key == self._last_np_key and now - self._last_np_time < NOW_PLAYING_COOLDOWN:
+            logger.debug("Now-playing cooldown: skipping %s — %s", track.artist, track.title)
+            return
+
         track = self.canonicalize(track)
 
         try:
@@ -177,6 +192,8 @@ class Scrobbler:
                 album=track.album or "",
                 duration=track.duration or 0,
             )
+            self._last_np_key  = np_key
+            self._last_np_time = now
             logger.info("Now playing: %s - %s", track.artist, track.title)
         except Exception as e:
             logger.debug("Failed to update now playing: %s", e)
