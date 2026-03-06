@@ -51,16 +51,15 @@ def _find_font() -> Optional[str]:
 
 
 def _to_fb(img: Any) -> bytes:
-    """Convert PIL RGB → BGR565 LE with ILI9486 INVON compensation.
+    """Convert PIL RGB → RGB565 LE with ILI9486 INVON compensation.
 
-    The ILI9486 MADCTL register has BGR bit set (0x28), so the display
-    expects BGR byte order. The INVON command inverts all pixels, so we
-    XOR with 0xFFFF to pre-compensate.
+    The framebuffer expects standard RGB565 (R in high bits).
+    The INVON command inverts all pixels, so we XOR with 0xFFFF to pre-compensate.
     """
     arr = np.array(img.convert("RGB"), dtype=np.uint16)
     r, g, b = arr[:, :, 0] >> 3, arr[:, :, 1] >> 2, arr[:, :, 2] >> 3
-    # BGR565: blue in high bits, red in low bits (swap R↔B vs standard RGB565)
-    return ((b << 11 | g << 5 | r) ^ 0xFFFF).astype("<u2").tobytes()
+    # RGB565: red in high bits, blue in low bits
+    return ((r << 11 | g << 5 | b) ^ 0xFFFF).astype("<u2").tobytes()
 
 
 def _enhance(img: Any) -> Any:

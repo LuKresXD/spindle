@@ -32,7 +32,7 @@ class AudioConfig:
     device: str = "default"
     sample_rate: int = 44100
     channels: int = 2
-    chunk_duration: int = 10
+    chunk_duration: int = 6
 
 
 @dataclass
