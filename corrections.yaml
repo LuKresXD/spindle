@@ -1,0 +1,17 @@
+# Fingerprint corrections — applied after AcoustID/ShazamIO identification.
+#
+# Each entry matches on artist + title (case-insensitive).
+#   replace: {artist, title}  → substitute the correct track
+#   replace: null              → drop the match entirely (ignore)
+#
+# Use this for:
+#   - Sampled tracks that fingerprint as the sample source
+#   - Persistent false positives from specific recordings
+
+- match:
+    artist: "Sibylle Baier"
+    title: "Give Me a Smile"
+  replace:
+    artist: "Dean Blunt"
+    title: "14"
+    album: "ZUSHI"

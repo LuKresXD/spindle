@@ -141,6 +141,7 @@ def main():
             chat_id=cfg.telegram.chat_id,
             session=session,
             history=history,
+            notifier=notifier,
         )
         bot.start()
 
@@ -330,6 +331,7 @@ def main():
                                 al.tracklist.artist, al.tracklist.album_name,
                                 al.current_index + 1, len(al.tracklist.tracks),
                                 track.title,
+                                art_url=spotify_result.album_art_url if spotify_result else None,
                             )
 
                     # Log compilation mode switch

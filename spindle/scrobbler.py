@@ -256,6 +256,11 @@ class Scrobbler:
     def canonicalize(self, track: TrackInfo) -> TrackInfo:
         if not self.network:
             return track
+        # Skip Last.fm corrections when track is already Spotify-enriched.
+        # Last.fm's correction DB is often stale (e.g. "Travis Scott" →
+        # "Travi$ Scott") whereas Spotify metadata is authoritative.
+        if track.source.startswith("spotify"):
+            return track
         return canonicalize_track(track, self.network)
 
     @staticmethod

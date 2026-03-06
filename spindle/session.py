@@ -47,6 +47,7 @@ FALLBACK_TRACK_DURATION = 240  # assumed duration (s) when Spotify has none (4 m
 
 # ── Compilation detection ─────────────────────────────────────────────────────
 MISMATCH_THRESHOLD = 2      # consecutive off-album IDs → switch to COMPILATION
+CONFIRM_THRESHOLD  = 2      # times a track must be identified before acting on it
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -147,6 +148,13 @@ class ScrobbleSession:
         # Shared across mode switches; cleared only on silence.
         self._session_scrobbled: set[tuple[str, str]] = set()
 
+        # Confirmation counter: (artist_lower, title_lower) → hit count.
+        # A track must be identified CONFIRM_THRESHOLD times before it
+        # affects the session (starts album lock, becomes an anchor, or
+        # gets scrobbled in compilation mode).  One-off false fingerprint
+        # matches never reach 2 and are silently discarded.
+        self._confirm_counts: dict[tuple[str, str], int] = {}
+
     # ── Properties ───────────────────────────────────────────────────────────
 
     @property
@@ -171,6 +179,10 @@ class ScrobbleSession:
         The caller must also call check_advance() each chunk for
         timing-based track advances.
         """
+        # ── Confirmation gate: require N identifications before acting ──────
+        if not self._is_confirmed(spotify_track.track):
+            return []
+
         # ── Compilation mode: no tracklist needed, just dedup + scrobble ────
         if self.mode == SessionMode.COMPILATION:
             return self._handle_compilation_id(spotify_track)
@@ -311,6 +323,27 @@ class ScrobbleSession:
         self._mismatch_count     = 0
         self._comp_count         = 0
         self._session_scrobbled.clear()
+        self._confirm_counts.clear()
+
+    # ── Confirmation gate ────────────────────────────────────────────────────
+
+    def _is_confirmed(self, track: TrackInfo) -> bool:
+        """Return True once this track has been identified enough times.
+
+        Increments the counter each call.  False fingerprint hits are
+        typically one-offs; real tracks playing on vinyl are identified
+        repeatedly (every ~2 s), so they pass quickly.
+        """
+        key = (track.artist.lower(), track.title.lower())
+        self._confirm_counts[key] = self._confirm_counts.get(key, 0) + 1
+        count = self._confirm_counts[key]
+        if count < CONFIRM_THRESHOLD:
+            logger.debug(
+                "Session: confirm %d/%d — '%s — %s'",
+                count, CONFIRM_THRESHOLD, track.artist, track.title,
+            )
+            return False
+        return True
 
     # ── Session-level dedup ───────────────────────────────────────────────────
 
@@ -438,12 +471,26 @@ class ScrobbleSession:
 
         # 2. Different edition: same artist, normalized title exists in our tracklist
         locked_artist = self._album.tracklist.artist.lower()
+        norm = normalize_title(spotify_track.track.title)
+
         # Accommodate "Various Artists" compilations — skip artist check
         if locked_artist != "various artists":
             if spotify_track.track.artist.lower() != locked_artist:
-                return None  # genuinely different artist
+                # Different primary artist — but check if the title matches
+                # a track in the locked album anyway. Feat. tracks (e.g.
+                # "Aye (feat. Travis Scott)" by Lil Uzi Vert on a Travis
+                # Scott album) have different primary artists on Spotify
+                # but are still on the album.
+                for i, t in enumerate(self._album.tracklist.tracks):
+                    if normalize_title(t.title) == norm:
+                        logger.debug(
+                            "Session: feat. match — '%s — %s' ≈ tracklist '%s' (index %d)",
+                            spotify_track.track.artist, spotify_track.track.title,
+                            t.title, i,
+                        )
+                        return i
+                return None  # genuinely different artist + title not in tracklist
 
-        norm = normalize_title(spotify_track.track.title)
         for i, t in enumerate(self._album.tracklist.tracks):
             if normalize_title(t.title) == norm:
                 logger.debug(
@@ -503,9 +550,15 @@ class ScrobbleSession:
     # ── Album mode: scrobbling helpers ────────────────────────────────────────
 
     def _try_scrobble(
-        self, index: int, timestamp: float,
+        self, index: int, timestamp: float, force: bool = False,
     ) -> list[tuple[TrackInfo, float]]:
-        """Scrobble album track at `index` if eligible and not already done."""
+        """Scrobble album track at `index` if eligible and not already done.
+
+        Args:
+            force: Skip the min-duration check. Used for gap-fill and
+                   backfill where we *know* the track played (it sits
+                   between two confirmed anchors or timing says so).
+        """
         if not self._album:
             return []
         track = self._album.tracklist.get_track_at(index)
@@ -517,7 +570,7 @@ class ScrobbleSession:
             logger.debug("Session dedup: '%s — %s'", track.artist, track.title)
             self._album.scrobbled.add(index)  # mark to avoid repeated log spam
             return []
-        if track.duration and track.duration < self.min_play_seconds:
+        if not force and track.duration and track.duration < self.min_play_seconds:
             return []
         self._album.scrobbled.add(index)
         self._mark_scrobbled(track)
@@ -578,7 +631,7 @@ class ScrobbleSession:
             track = tracklist.get_track_at(i)
             if not track:
                 break
-            result.extend(self._try_scrobble(i, ts))
+            result.extend(self._try_scrobble(i, ts, force=True))
             ts += track.duration if track.duration else FALLBACK_TRACK_DURATION
 
         # Refine estimated start time for the anchor track itself
@@ -606,7 +659,7 @@ class ScrobbleSession:
             track = self._album.tracklist.get_track_at(i)
             if not track:
                 break
-            result.extend(self._try_scrobble(i, ts))
+            result.extend(self._try_scrobble(i, ts, force=True))
             # Use fallback so the next track gets a distinct timestamp even
             # when Spotify has no duration data — duplicate timestamps are
             # silently rejected by Last.fm.
