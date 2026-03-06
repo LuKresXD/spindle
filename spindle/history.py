@@ -3,7 +3,6 @@
 import json
 import logging
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -143,7 +142,6 @@ class ScrobbleHistory:
                 "listening_time": 0, "listening_time_today": 0,
             }
 
-        now = time.time()
         today_start = self._period_start("today")
         week_start = self._period_start("week")
         month_start = self._period_start("month")

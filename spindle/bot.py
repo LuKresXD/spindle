@@ -26,7 +26,7 @@ import requests
 import yaml
 
 if TYPE_CHECKING:
-    from .session import ScrobbleSession, SessionMode
+    from .session import ScrobbleSession
     from .history import ScrobbleHistory
     from .notify import Notifier
 
@@ -272,7 +272,7 @@ class SpindleBot:
         if mode == SessionMode.ALBUM:
             al = self.session.album_state
             if al:
-                lines.append(f"Mode: <b>ALBUM</b>")
+                lines.append("Mode: <b>ALBUM</b>")
                 lines.append(f"Album: {_esc(al.tracklist.artist)} — <i>{_esc(al.tracklist.album_name)}</i>")
                 lines.append(f"Track: {al.current_index + 1}/{len(al.tracklist.tracks)}")
                 lines.append(f"Scrobbled: {len(al.scrobbled)}")
@@ -283,14 +283,14 @@ class SpindleBot:
                     lines.append(f"Position: {_format_mmss(progress[0])} / {_format_mmss(progress[1])}")
 
         elif mode == SessionMode.COMPILATION:
-            lines.append(f"Mode: <b>COMPILATION</b>")
+            lines.append("Mode: <b>COMPILATION</b>")
             lines.append(f"Scrobbled: {self.session.comp_scrobbled_count} tracks")
 
         # Recognition stats for today
         if self.history:
             rec = self.history.recognition_stats(self.history._period_start("today"))
             if rec["total"] > 0:
-                lines.append(f"\n🎯 Recognition today:")
+                lines.append("\n🎯 Recognition today:")
                 lines.append(f"  Fingerprinted: {rec['live']}")
                 lines.append(f"  Timing-inferred: {rec['backfill']}")
                 rate_pct = rec["rate"] * 100

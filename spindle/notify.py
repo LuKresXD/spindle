@@ -198,7 +198,7 @@ class Notifier:
                       tracks_scrobbled: int, total_played: int) -> None:
         """Notify when an album side/session ends — includes track listing."""
         lines = [
-            f"⏹ <b>Side finished</b>",
+            "⏹ <b>Side finished</b>",
             f"{_esc(artist)} — <i>{_esc(album)}</i>",
             "",
         ]
@@ -219,7 +219,7 @@ class Notifier:
     def compilation_finished(self, tracks_scrobbled: int) -> None:
         """Notify when a compilation session ends."""
         lines = [
-            f"⏹ <b>Compilation finished</b>",
+            "⏹ <b>Compilation finished</b>",
             "",
         ]
 
